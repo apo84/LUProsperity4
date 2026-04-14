@@ -5,6 +5,7 @@ Plot ROUND1 prices data only.
 Per product:
 - Bid prices (`bid_price_1..3`) as scatter `x` points
 - Ask prices (`ask_price_1..3`) as scatter `+` points
+- Trade prices from `trades_round_1_day_*.csv` as red `x` points
 - Weighted average price across bid and ask levels
 - `mid_price` as a connected series
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -20,6 +22,7 @@ import pandas as pd
 
 PRODUCTS = ["ASH_COATED_OSMIUM", "INTARIAN_PEPPER_ROOT"]
 PRICE_FILE_GLOB = "prices_round_1_day_*.csv"
+TRADE_FILE_GLOB = "trades_round_1_day_*.csv"
 
 # (day, timestamp) bounds. Adjust as needed.
 START_TIME = (0, 990_000)
@@ -70,6 +73,37 @@ def load_prices(round_folder: Path) -> pd.DataFrame:
     max_timestamp = int(df["timestamp"].max())
     df["time"] = map_time(df["day"], df["timestamp"], min_day, max_timestamp)
     return df
+
+
+def load_trades(round_folder: Path, min_day: int, max_timestamp: int) -> pd.DataFrame:
+    files = sorted(round_folder.glob(TRADE_FILE_GLOB))
+    if not files:
+        return pd.DataFrame(columns=["day", "timestamp", "product", "trade_price", "quantity", "time"])
+
+    frames: list[pd.DataFrame] = []
+    day_pattern = re.compile(r"trades_round_1_day_(-?\d+)\.csv$")
+    for file_path in files:
+        match = day_pattern.search(file_path.name)
+        if not match:
+            continue
+        day = int(match.group(1))
+        frame = pd.read_csv(file_path, sep=";")
+        if not {"timestamp", "symbol", "price", "quantity"}.issubset(frame.columns):
+            continue
+        frame = frame.rename(columns={"symbol": "product", "price": "trade_price"})
+        frame["day"] = day
+        frame["trade_price"] = pd.to_numeric(frame["trade_price"], errors="coerce")
+        frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
+        frame = frame.dropna(subset=["timestamp", "product", "trade_price"])
+        frames.append(frame[["day", "timestamp", "product", "trade_price", "quantity"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["day", "timestamp", "product", "trade_price", "quantity", "time"])
+
+    trades = pd.concat(frames, ignore_index=True)
+    trades = trades.sort_values(["day", "timestamp"]).reset_index(drop=True)
+    trades["time"] = map_time(trades["day"], trades["timestamp"], min_day, max_timestamp)
+    return trades
 
 
 def build_bid_points(product_df: pd.DataFrame) -> pd.DataFrame:
@@ -133,7 +167,9 @@ def compute_weighted_avg_book_price(product_df: pd.DataFrame) -> pd.Series:
     return weighted_avg.where(denominator > 0)
 
 
-def plot_product(product_df: pd.DataFrame, product_name: str, output_path: Path) -> None:
+def plot_product(
+    product_df: pd.DataFrame, trades_df: pd.DataFrame, product_name: str, output_path: Path
+) -> None:
     bid_points = build_bid_points(product_df)
     ask_points = build_ask_points(product_df)
     weighted_avg_book = compute_weighted_avg_book_price(product_df)
@@ -156,11 +192,21 @@ def plot_product(product_df: pd.DataFrame, product_name: str, output_path: Path)
         ax.scatter(
             ask_points["time"],
             ask_points["ask_price"],
-            color="tab:red",
+            color="tab:purple",
             marker="+",
             s=24,
             linewidths=1.0,
             label="Ask prices",
+        )
+    if not trades_df.empty:
+        ax.scatter(
+            trades_df["time"],
+            trades_df["trade_price"],
+            color="red",
+            marker="x",
+            s=30,
+            linewidths=1.0,
+            label="Trades",
         )
 
     ax.plot(
@@ -214,10 +260,14 @@ def main() -> None:
     df = load_prices(round_folder)
     min_day = int(df["day"].min())
     max_timestamp = int(df["timestamp"].max())
+    trades = load_trades(round_folder, min_day, max_timestamp)
     window_mask = in_time_window(df["day"], df["timestamp"], START_TIME, END_TIME)
     df = df[window_mask].copy()
     if df.empty:
         raise ValueError("No price rows in selected START_TIME/END_TIME window")
+    if not trades.empty:
+        trade_window_mask = in_time_window(trades["day"], trades["timestamp"], START_TIME, END_TIME)
+        trades = trades[trade_window_mask].copy()
 
     selected_days = sorted(df["day"].unique().tolist())
     print(
@@ -230,11 +280,12 @@ def main() -> None:
 
     for product in PRODUCTS:
         product_df = df[df["product"] == product].copy()
+        product_trades = trades[trades["product"] == product].copy() if not trades.empty else trades
         if product_df.empty:
             print(f"Skipping {product}: no rows found.")
             continue
         output_path = output_dir / f"{product.lower()}_prices_only_timeseries.png"
-        plot_product(product_df, product, output_path)
+        plot_product(product_df, product_trades, product, output_path)
         print(f"Wrote {output_path}")
 
 
